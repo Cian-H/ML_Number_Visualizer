@@ -27,16 +27,16 @@ class LightningVAE(L.LightningModule):
         self.encoder = nn.Sequential(
             nn.Flatten(),
             nn.Linear(784, 256),
-            nn.ReLU(),
+            nn.Mish(),
             nn.Linear(256, 128),
-            nn.ReLU(),
+            nn.Mish(),
             nn.Linear(128, latent_dim * 2),
         )
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, 128),
-            nn.ReLU(),
+            nn.Mish(),
             nn.Linear(128, 256),
-            nn.ReLU(),
+            nn.Mish(),
             nn.Linear(256, 784),
             nn.Sigmoid(),
         )
@@ -67,20 +67,42 @@ class LightningVAE(L.LightningModule):
 
 # Surrogates (blue & green channels)
 class BaseSurrogate(L.LightningModule):
-    def __init__(self, teacher_model: TeacherModel, learning_rate: float = 1e-3):
+    def __init__(
+        self,
+        teacher_model: TeacherModel,
+        learning_rate: float = 1e-3,
+        init_temperature: float = 4.0,
+        min_temperature: float = 1.0,
+        weight_decay: float = 1e-4,
+    ):
         super().__init__()
         self.learning_rate = learning_rate
         self.teacher_model = teacher_model
+        self.init_temperature = init_temperature
+        self.min_temperature = min_temperature
+        self.weight_decay = weight_decay
+
+        # Start at the maximum high-entropy temperature
+        self.temperature = init_temperature
 
     def _get_target_probs(self, x: Tensor) -> Tensor:
         return self.teacher_model.get_target_probs(x)
 
     def _shared_distillation_step(self, batch: tuple[Tensor, Any], step_name: str):
         x, _ = batch
-        target_probs = self._get_target_probs(x)
+
+        with torch.no_grad():
+            teacher_probs = torch.clamp(self._get_target_probs(x), min=1e-7, max=1.0)
+            teacher_soft = torch.pow(teacher_probs, 1.0 / self.temperature)
+            teacher_soft = teacher_soft / teacher_soft.sum(dim=1, keepdim=True)
+
         surrogate_logits = self(x)
-        loss = F.cross_entropy(surrogate_logits, target_probs)
+        surrogate_log_probs = F.log_softmax(surrogate_logits / self.temperature, dim=1)
+        loss = F.kl_div(surrogate_log_probs, teacher_soft, reduction="batchmean") * (
+            self.temperature**2
+        )
         self.log(f"{step_name}_loss", loss, prog_bar=True)
+        self.log("distill_temp", self.temperature, prog_bar=False)
         return loss
 
     def training_step(self, batch: tuple[Tensor, Any], _: int):
@@ -89,23 +111,49 @@ class BaseSurrogate(L.LightningModule):
     def validation_step(self, batch: tuple[Tensor, Any], _: int):
         return self._shared_distillation_step(batch, "val")
 
+    @property
+    def max_epochs(self) -> int:
+        max_epochs = self.trainer.max_epochs if self.trainer else None
+        return max_epochs if max_epochs else 10
+
+    def on_train_epoch_end(self):
+        max_epochs = self.max_epochs
+        epoch = self.current_epoch
+
+        if max_epochs > 1:
+            decay_step = (self.init_temperature - self.min_temperature) / (max_epochs - 1)
+            self.temperature = max(
+                self.min_temperature, self.init_temperature - (epoch * decay_step)
+            )
+
     def configure_optimizers(self):
-        return optim.Adam(self.parameters(), lr=self.learning_rate)
+        optimizer = optim.AdamW(
+            self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+        )
+
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.max_epochs, eta_min=1e-6)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1},
+        }
 
 
 class LightningSurrogateFlat(BaseSurrogate):
-    def __init__(self, teacher_model: TeacherModel, learning_rate: float = 1e-3):
-        super().__init__(teacher_model, learning_rate)
+    def __init__(self, teacher_model: TeacherModel, **kwargs):
+        super().__init__(teacher_model, **kwargs)
         self.net = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(784, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
+            nn.Linear(784, 2048),
+            nn.Mish(),
+            nn.Linear(2048, 1024),
+            nn.Mish(),
+            nn.Linear(1024, 512),
+            nn.Mish(),
             nn.Linear(512, 256),
-            nn.ReLU(),
+            nn.Mish(),
             nn.Linear(256, 128),
-            nn.ReLU(),
+            nn.Mish(),
             nn.Linear(128, 10),
         )
 
@@ -114,19 +162,22 @@ class LightningSurrogateFlat(BaseSurrogate):
 
 
 class LightningSurrogateCNN(BaseSurrogate):
-    def __init__(self, teacher_model: TeacherModel, learning_rate: float = 1e-3):
-        super().__init__(teacher_model, learning_rate)
+    def __init__(self, teacher_model: TeacherModel, **kwargs):
+        super().__init__(teacher_model, **kwargs)
         self.net = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.Mish(),
             nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(32, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.Mish(),
             nn.MaxPool2d(2),
             nn.Flatten(),
-            nn.Linear(32 * 7 * 7, 128),
-            nn.ReLU(),
-            nn.Linear(128, 10),
+            nn.Linear(128 * 7 * 7, 256),
+            nn.Mish(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 10),
         )
 
     def forward(self, x):
@@ -137,7 +188,6 @@ class LightningSurrogateCNN(BaseSurrogate):
 def generate_vae_channel_differentiable(
     oracle_model: nn.Module, vae: LightningVAE, device: torch.device, num_steps: int = 1500
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generates the VAE dream (red channel) using a differentiable oracle."""
     batch_size = 10
     target_classes = torch.arange(batch_size, device=device, dtype=torch.long)
 
@@ -166,9 +216,9 @@ def generate_vae_channel_non_differentiable(
     val_loader,
     device: torch.device,
     num_steps: int = 1500,
-) -> tuple[np.ndarray, np.ndarray, LightningSurrogateCNN]:
-    logger.info("Model is not differentiable. Training spatial oracle surrogate (CNN) for VAE...")
-    cnn_surrogate = LightningSurrogateCNN(teacher_model=teacher_model)
+) -> tuple[np.ndarray, np.ndarray, LightningSurrogateFlat]:
+    logger.info("Model is not differentiable. Training spatial oracle surrogate for VAE...")
+    surrogate = LightningSurrogateFlat(teacher_model=teacher_model)
     early_stop = EarlyStopping(monitor="val_loss", min_delta=0.001, patience=2, mode="min")
 
     cnn_trainer = L.Trainer(
@@ -178,14 +228,14 @@ def generate_vae_channel_non_differentiable(
         enable_model_summary=False,
         logger=False,
     )
-    cnn_trainer.fit(cnn_surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    cnn_trainer.fit(surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    cnn_surrogate.to(device).eval()
-    for p in cnn_surrogate.parameters():
+    surrogate.to(device).eval()
+    for p in surrogate.parameters():
         p.requires_grad = False
 
-    images, confs = generate_vae_channel_differentiable(cnn_surrogate, vae, device, num_steps)
-    return images, confs, cnn_surrogate
+    images, confs = generate_vae_channel_differentiable(surrogate, vae, device, num_steps)
+    return images, confs, surrogate
 
 
 def dream_input_space(
@@ -240,7 +290,7 @@ def analyze_model(
     num_steps: int = 1500,
     target_digits: Iterable[int] = range(10),
 ) -> None:
-    logger.info(f"\n{'=' * 50}\nAnalyzing Architecture: '{model_name.upper()}'\n{'=' * 50}")
+    logger.info(f"Analyzing Architecture: '{model_name}'")
 
     early_stop = EarlyStopping(monitor="val_loss", min_delta=0.001, patience=2, mode="min")
 

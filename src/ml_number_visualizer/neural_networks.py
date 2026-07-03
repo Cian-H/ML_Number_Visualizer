@@ -11,10 +11,10 @@ class FlatStrategy(nn.Module):
         self.net = nn.Sequential(
             nn.Flatten(),
             nn.Linear(784, 256),
-            nn.ReLU(),
+            nn.Mish(),
             nn.Dropout(0.2),
             nn.Linear(256, 128),
-            nn.ReLU(),
+            nn.Mish(),
             nn.Linear(128, 10),
         )
 
@@ -27,14 +27,14 @@ class CNNStrategy(nn.Module):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
+            nn.Mish(),
             nn.MaxPool2d(2, 2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
+            nn.Mish(),
             nn.MaxPool2d(2, 2),
         )
         self.classifier = nn.Sequential(
-            nn.Dropout(0.25), nn.Linear(64 * 7 * 7, 128), nn.ReLU(), nn.Linear(128, 10)
+            nn.Dropout(0.25), nn.Linear(64 * 7 * 7, 128), nn.Mish(), nn.Linear(128, 10)
         )
 
     def forward(self, x):
