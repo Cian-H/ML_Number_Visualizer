@@ -1,0 +1,56 @@
+[project]
+name = "ml-number-visualiser"
+version = "0.1.0"
+description = "For visualising number representations learned by various ML models"
+authors = [{ name = "Cian Hughes", email = "chughes000@gmail.com" }]
+dependencies = [
+    "torch>=2.4.1",
+    "lightning>=2.4.0",
+    "torchvision>=0.19.1",
+    "tensorboard>=2.17.1",
+    "typer>=0.12.5",
+    "jupyter>=1.1.1",
+    "safetensors>=0.4.5",
+    "pyarrow>=17.0.0",
+    "loguru>=0.7.2",
+    "snoop>=0.4.3",
+    "polars>=1.42.1",
+    "matplotlib>=3.11.0",
+]
+readme = "README.md"
+requires-python = "==3.13.*"
+classifiers = ["Private :: Do Not Upload"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "W",   # pycodestyle warnings
+    "C90", # mccabe (cyclomatic complexity)
+    "B",   # flake8-bugbear (good practice/bug prevention)
+    "C4",  # flake8-comprehensions (favors functional style)
+    "SIM", # flake8-simplify (simplifies code)
+    "RET", # flake8-return (consistent returns)
+    "UP",  # pyupgrade (modern python syntax)
+    "RUF", # ruff-specific good practices
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[dependency-groups]
+dev = ["ruff>=0.15.18", "ty>=0.0.52"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ml_number_visualizer"]
