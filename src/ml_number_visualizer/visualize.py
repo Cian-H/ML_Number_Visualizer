@@ -1,7 +1,6 @@
-import pickle
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import lightning as L
 import matplotlib.pyplot as plt
@@ -14,7 +13,6 @@ from loguru import logger
 from torch import Tensor, nn, optim
 
 from ml_number_visualizer.dataloader import get_dataset
-from ml_number_visualizer.neural_networks import QMNISTClassifier
 from ml_number_visualizer.protocols import TeacherModel
 
 
@@ -74,21 +72,8 @@ class BaseSurrogate(L.LightningModule):
         self.learning_rate = learning_rate
         self.teacher_model = teacher_model
 
-        # Only freeze the model if it's a PyTorch module
-        if isinstance(self.teacher_model, nn.Module):
-            self.teacher_model.eval()
-            for param in self.teacher_model.parameters():
-                param.requires_grad = False
-
     def _get_target_probs(self, x: Tensor) -> Tensor:
-        if isinstance(self.teacher_model, nn.Module):
-            with torch.no_grad():
-                logits = self.teacher_model(x)
-                return F.softmax(logits, dim=1)
-        else:
-            x_flat = x.view(x.size(0), -1).detach().cpu().numpy()
-            probs = self.teacher_model.predict_proba(x_flat)
-            return torch.tensor(probs, dtype=torch.float32, device=self.device)
+        return self.teacher_model.get_target_probs(x)
 
     def _shared_distillation_step(self, batch: tuple[Tensor, Any], step_name: str):
         x, _ = batch
@@ -149,9 +134,10 @@ class LightningSurrogateCNN(BaseSurrogate):
 
 
 # Dream generators
-def dream_human_prior(
+def generate_vae_channel_differentiable(
     oracle_model: nn.Module, vae: LightningVAE, device: torch.device, num_steps: int = 1500
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Generates the VAE dream (red channel) using a differentiable oracle."""
     batch_size = 10
     target_classes = torch.arange(batch_size, device=device, dtype=torch.long)
 
@@ -171,6 +157,35 @@ def dream_human_prior(
     confidences = probs[torch.arange(batch_size), target_classes].detach().cpu().numpy()
 
     return final_images.detach().cpu().squeeze(1).numpy(), confidences
+
+
+def generate_vae_channel_non_differentiable(
+    teacher_model: TeacherModel,
+    vae: LightningVAE,
+    train_loader,
+    val_loader,
+    device: torch.device,
+    num_steps: int = 1500,
+) -> tuple[np.ndarray, np.ndarray, LightningSurrogateCNN]:
+    logger.info("Model is not differentiable. Training spatial oracle surrogate (CNN) for VAE...")
+    cnn_surrogate = LightningSurrogateCNN(teacher_model=teacher_model)
+    early_stop = EarlyStopping(monitor="val_loss", min_delta=0.001, patience=2, mode="min")
+
+    cnn_trainer = L.Trainer(
+        max_epochs=10,
+        accelerator="auto",
+        callbacks=[early_stop],
+        enable_model_summary=False,
+        logger=False,
+    )
+    cnn_trainer.fit(cnn_surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+    cnn_surrogate.to(device).eval()
+    for p in cnn_surrogate.parameters():
+        p.requires_grad = False
+
+    images, confs = generate_vae_channel_differentiable(cnn_surrogate, vae, device, num_steps)
+    return images, confs, cnn_surrogate
 
 
 def dream_input_space(
@@ -244,32 +259,35 @@ def analyze_model(
     for p in flat_surrogate.parameters():
         p.requires_grad = False
 
-    # Train CNN surrogate (green channel)
-    logger.info("Training spatially optimal surrogate (CNN)...")
-    cnn_surrogate = LightningSurrogateCNN(teacher_model=teacher_model)
-    cnn_trainer = L.Trainer(
-        max_epochs=10,
-        accelerator="auto",
-        callbacks=[early_stop],
-        enable_model_summary=False,
-        logger=False,
-    )
-    cnn_trainer.fit(cnn_surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    cnn_surrogate.to(device).eval()
-    for p in cnn_surrogate.parameters():
-        p.requires_grad = False
+    # Dispatch VAE generation based on differentiability
+    if teacher_model.is_differentiable:
+        oracle_model = teacher_model.get_differentiable_model()
+        vae_images, vae_confs = generate_vae_channel_differentiable(
+            oracle_model, vae, device, num_steps
+        )
 
-    # Determine differentiable oracle for VAE
-    if isinstance(teacher_model, nn.Module):
-        oracle_model = teacher_model
+        # We still need the CNN Surrogate for the green channel
+        logger.info("Training spatially optimal surrogate (CNN)...")
+        cnn_surrogate = LightningSurrogateCNN(teacher_model=teacher_model)
+        cnn_trainer = L.Trainer(
+            max_epochs=10,
+            accelerator="auto",
+            callbacks=[early_stop],
+            enable_model_summary=False,
+            logger=False,
+        )
+        cnn_trainer.fit(cnn_surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        cnn_surrogate.to(device).eval()
+        for p in cnn_surrogate.parameters():
+            p.requires_grad = False
     else:
-        logger.info(f"'{model_name}' is not differentiable. Using CNN Surrogate as Oracle for VAE.")
-        oracle_model = cnn_surrogate
+        vae_images, vae_confs, cnn_surrogate = generate_vae_channel_non_differentiable(
+            teacher_model, vae, train_loader, val_loader, device, num_steps
+        )
 
-    # Generate the 3 dreams
-    vae_images, vae_confs = dream_human_prior(oracle_model, vae, device, num_steps)
     logger.info("Dreaming GREEN Channel (Spatial Truth via CNN)...")
     cnn_images, cnn_confs = dream_input_space(cnn_surrogate, device, num_steps, tv_weight=1e-5)
+
     logger.info("Dreaming BLUE Channel (Relational Truth via Flat)...")
     flat_images, flat_confs = dream_input_space(flat_surrogate, device, num_steps, tv_weight=1e-4)
 
@@ -301,7 +319,12 @@ def analyze_model(
 
 
 # Public pipeline API
-def generate_all_digits(num_steps: int = 1500) -> None:
+def generate_visualizations_for_model(
+    model_name: str,
+    teacher_model: TeacherModel,
+    target_digits: Iterable[int] = range(10),
+    num_steps: int = 1500,
+) -> None:
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
@@ -323,28 +346,25 @@ def generate_all_digits(num_steps: int = 1500) -> None:
     for p in vae.parameters():
         p.requires_grad = False
 
-    architectures: tuple[Literal["flat", "cnn", "vit"], ...] = ("flat", "cnn", "vit")
+    analyze_model(
+        teacher_model=teacher_model,
+        model_name=model_name,
+        vae=vae,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        num_steps=num_steps,
+        target_digits=target_digits,
+    )
 
-    for strategy in architectures:
-        model = QMNISTClassifier(model_type=strategy)
-        try:
-            model.load_state_dict(
-                torch.load(f"./models/nn_{strategy}.pth", map_location=device, weights_only=True)
-            )
-        except FileNotFoundError:
-            logger.warning(f"Could not find weights for '{strategy}'. Skipping.")
-            continue
-
-        model.to(device)
-        analyze_model(model, strategy, vae, train_loader, val_loader, device, num_steps)
-
-    logger.success("All models successfully visualized via RGB Compositing!")
+    logger.success(f"Visualizations completed for '{model_name}'!")
 
 
-def generate_digit_for_sklearn_model(
-    model_name: str, target_digit: int, num_steps: int = 1500
+def generate_visualizations_for_models(
+    models: Mapping[str, TeacherModel],
+    target_digits: Iterable[int] = range(10),
+    num_steps: int = 1500,
 ) -> None:
-    """Wrapper to run a specific Sklearn or PyTorch model for a single digit."""
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
@@ -352,28 +372,40 @@ def generate_digit_for_sklearn_model(
         if torch.backends.mps.is_available()
         else "cpu"
     )
+    logger.info(f"Using execution target: {device}. Processing {len(models)} models.")
+
     train_loader, val_loader, _ = get_dataset()
 
+    logger.info("Training Global VAE (Human Prior)...")
     vae = LightningVAE()
     vae_trainer = L.Trainer(
         max_epochs=3, accelerator="auto", devices="auto", enable_model_summary=False, logger=False
     )
     vae_trainer.fit(vae, train_dataloaders=train_loader)
     vae.to(device).eval()
+    for p in vae.parameters():
+        p.requires_grad = False
 
-    with open(f"./models/{model_name}.pkl", "rb") as f:
-        model = pickle.load(f)
+    # Process each model sequentially
+    for model_name, teacher_adapter in models.items():
+        try:
+            analyze_model(
+                teacher_model=teacher_adapter,
+                model_name=model_name,
+                vae=vae,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                device=device,
+                num_steps=num_steps,
+                target_digits=target_digits,
+            )
+            logger.success(f"Successfully composited visualizations for '{model_name}'.")
 
-    analyze_model(
-        model,
-        model_name,
-        vae,
-        train_loader,
-        val_loader,
-        device,
-        num_steps,
-        target_digits=[target_digit],
-    )
+        except Exception as e:
+            logger.error(f"Pipeline failed for model '{model_name}': {e}")
+            continue
+
+    logger.success("Batch visualization pipeline complete!")
 
 
 def generate_legend() -> None:

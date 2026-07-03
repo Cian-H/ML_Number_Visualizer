@@ -44,9 +44,7 @@ class CNNStrategy(nn.Module):
 
 
 class ViTStrategy(nn.Module):
-    def __init__(
-        self, image_size=28, patch_size=7, num_classes=10, embed_dim=64, heads=4, depth=3
-    ):
+    def __init__(self, image_size=28, patch_size=7, num_classes=10, embed_dim=64, heads=4, depth=3):
         super().__init__()
         self.patch_size = patch_size
         num_patches = (image_size // patch_size) ** 2

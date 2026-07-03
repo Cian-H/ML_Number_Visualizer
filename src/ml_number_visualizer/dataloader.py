@@ -39,6 +39,7 @@ def collate(batch):
     y = torch.tensor(y)
     return x, y
 
+
 # This is just a quick, lazy way to ensure all models are trained on the same dataset
 @lru_cache(maxsize=1)
 def get_dataset():
