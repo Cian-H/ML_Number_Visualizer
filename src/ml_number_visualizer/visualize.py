@@ -1,4 +1,5 @@
 from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +39,6 @@ class LightningVAE(L.LightningModule):
             nn.Linear(128, 256),
             nn.Mish(),
             nn.Linear(256, 784),
-            nn.Sigmoid(),
         )
 
     def reparameterize(self, mu: Tensor, logvar: Tensor):
@@ -55,7 +55,7 @@ class LightningVAE(L.LightningModule):
     def training_step(self, batch: tuple[Tensor, Any], _: int):
         x, _ = batch
         recon_batch, mu, logvar = self(x)
-        BCE = F.binary_cross_entropy(recon_batch, x, reduction="sum") / x.size(0)
+        BCE = F.binary_cross_entropy_with_logits(recon_batch, x, reduction="sum") / x.size(0)
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
         loss = BCE + KLD
         self.log("vae_train_loss", loss)
@@ -196,13 +196,13 @@ def generate_vae_channel_differentiable(
 
     for _ in range(num_steps):
         optimizer.zero_grad()
-        images = vae.decoder(z).view(batch_size, 1, 28, 28)
+        images = vae.decoder(z).sigmoid().view(batch_size, 1, 28, 28)
         logits = oracle_model(images)
         loss = F.cross_entropy(logits, target_classes)
         loss.backward()
         optimizer.step()
 
-    final_images = vae.decoder(z).view(batch_size, 1, 28, 28)
+    final_images = vae.decoder(z).sigmoid().view(batch_size, 1, 28, 28)
     probs = F.softmax(oracle_model(final_images), dim=1)
     confidences = probs[torch.arange(batch_size), target_classes].detach().cpu().numpy()
 
@@ -225,8 +225,10 @@ def generate_vae_channel_non_differentiable(
         max_epochs=10,
         accelerator="auto",
         callbacks=[early_stop],
+        enable_checkpointing=False,
         enable_model_summary=False,
         logger=False,
+        precision="bf16-mixed",
     )
     cnn_trainer.fit(surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
@@ -301,8 +303,10 @@ def analyze_model(
         max_epochs=10,
         accelerator="auto",
         callbacks=[early_stop],
+        enable_checkpointing=False,
         enable_model_summary=False,
         logger=False,
+        precision="bf16-mixed",
     )
     flat_trainer.fit(flat_surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader)
     flat_surrogate.to(device).eval()
@@ -323,8 +327,10 @@ def analyze_model(
             max_epochs=10,
             accelerator="auto",
             callbacks=[early_stop],
+            enable_checkpointing=False,
             enable_model_summary=False,
             logger=False,
+            precision="bf16-mixed",
         )
         cnn_trainer.fit(cnn_surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader)
         cnn_surrogate.to(device).eval()
@@ -335,26 +341,27 @@ def analyze_model(
             teacher_model, vae, train_loader, val_loader, device, num_steps
         )
 
-    logger.info("Dreaming GREEN Channel (Spatial Truth via CNN)...")
-    cnn_images, cnn_confs = dream_input_space(cnn_surrogate, device, num_steps, tv_weight=1e-5)
-
-    logger.info("Dreaming BLUE Channel (Relational Truth via Flat)...")
-    flat_images, flat_confs = dream_input_space(flat_surrogate, device, num_steps, tv_weight=1e-4)
+    logger.info("Dreaming GREEN + BLUE Channels in parallel...")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fut_cnn = executor.submit(dream_input_space, cnn_surrogate, device, num_steps, 1e-5)
+        fut_flat = executor.submit(dream_input_space, flat_surrogate, device, num_steps, 1e-4)
+        cnn_images, cnn_confs = fut_cnn.result()
+        flat_images, flat_confs = fut_flat.result()
 
     # Composite requested digits
     plot_path = Path(f"plots/{model_name}")
     plot_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Compositing representational maps to {plot_path}/")
 
-    for digit in target_digits:
+    def _save_digit_plot(digit: int) -> None:
         rgb_map = np.zeros((28, 28, 3), dtype=np.float32)
         rgb_map[:, :, 0] = vae_images[digit]
         rgb_map[:, :, 1] = cnn_images[digit]
         rgb_map[:, :, 2] = flat_images[digit]
         rgb_map = np.clip(rgb_map, 0.0, 1.0)
 
-        plt.figure(figsize=(6, 6))
-        plt.imshow(rgb_map)
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.imshow(rgb_map)
 
         mean_conf = (vae_confs[digit] + cnn_confs[digit] + flat_confs[digit]) / 3.0 * 100
         title_text = (
@@ -362,10 +369,13 @@ def analyze_model(
             + f"Mean Confidence: {mean_conf:.1f}%"
         )
 
-        plt.title(title_text, fontsize=9, pad=10)
-        plt.axis("off")
-        plt.savefig(plot_path / f"{digit}.png", bbox_inches="tight", dpi=150)
-        plt.close()
+        ax.set_title(title_text, fontsize=9, pad=10)
+        ax.axis("off")
+        fig.savefig(plot_path / f"{digit}.png", bbox_inches="tight", dpi=150)
+        plt.close(fig)
+
+    with ThreadPoolExecutor() as executor:
+        list(executor.map(_save_digit_plot, target_digits))
 
 
 # Public pipeline API
@@ -389,7 +399,13 @@ def generate_visualizations_for_model(
     logger.info("Training Global VAE (Human Prior)...")
     vae = LightningVAE()
     vae_trainer = L.Trainer(
-        max_epochs=3, accelerator="auto", devices="auto", enable_model_summary=False, logger=False
+        max_epochs=3,
+        accelerator="auto",
+        devices="auto",
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        logger=False,
+        precision="bf16-mixed",
     )
     vae_trainer.fit(vae, train_dataloaders=train_loader)
     vae.to(device).eval()
@@ -429,7 +445,13 @@ def generate_visualizations_for_models(
     logger.info("Training Global VAE (Human Prior)...")
     vae = LightningVAE()
     vae_trainer = L.Trainer(
-        max_epochs=3, accelerator="auto", devices="auto", enable_model_summary=False, logger=False
+        max_epochs=3,
+        accelerator="auto",
+        devices="auto",
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        logger=False,
+        precision="bf16-mixed",
     )
     vae_trainer.fit(vae, train_dataloaders=train_loader)
     vae.to(device).eval()

@@ -2,7 +2,9 @@ import lightning as L
 import torch
 import torch.nn.functional as F
 from loguru import logger
-from torch import nn, optim
+from torch import Tensor, nn, optim
+
+torch.set_float32_matmul_precision("high")
 
 
 class FlatStrategy(nn.Module):
@@ -43,6 +45,56 @@ class CNNStrategy(nn.Module):
         return self.classifier(x)
 
 
+class FlashAttentionBlock(nn.Module):
+    """Multi-head self-attention backed by F.scaled_dot_product_attention.
+
+    On CUDA with BF16/FP16, PyTorch dispatches SDPA to the Flash Attention
+    kernel automatically — no extra dependencies required.
+    """
+
+    def __init__(self, embed_dim: int, heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
+        self.heads = heads
+        self.head_dim = embed_dim // heads
+
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = dropout
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # (B, heads, N, head_dim) each
+        x = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout if self.training else 0.0
+        )
+        x = x.transpose(1, 2).reshape(B, N, C)
+        return self.out_proj(x)
+
+
+class FlashTransformerBlock(nn.Module):
+    """Pre-norm transformer encoder block wrapping FlashAttentionBlock."""
+
+    def __init__(self, embed_dim: int, heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = FlashAttentionBlock(embed_dim, heads, dropout)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        mlp_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, embed_dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
 class ViTStrategy(nn.Module):
     def __init__(self, image_size=28, patch_size=7, num_classes=10, embed_dim=64, heads=4, depth=3):
         super().__init__()
@@ -54,8 +106,9 @@ class ViTStrategy(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, num_patches + 1, embed_dim))
         self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=heads, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.transformer = nn.Sequential(
+            *[FlashTransformerBlock(embed_dim, heads) for _ in range(depth)]
+        )
         self.mlp_head = nn.Linear(embed_dim, num_classes)
 
     def forward(self, x):
@@ -130,6 +183,8 @@ def train_neural_networks(train_loader, val_loader, test_loader):
             max_epochs=5,
             accelerator="auto",
             devices="auto",
+            precision="bf16-mixed",
+            enable_checkpointing=False,
         )
         trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
         trainer.test(model=model, dataloaders=test_loader)
