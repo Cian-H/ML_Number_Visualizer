@@ -199,8 +199,9 @@ def train_neural_networks(
     for s in STRATEGY_REGISTRY:
         logger.info(f"Initializing {s}...")
         model_name = f"nn_{s}"
+        lr = 7.5e-5 if s == "vit" else 5e-5
         snapshot_cb = EpochSnapshotCallback(model_name=model_name)
-        model = QMNISTClassifier(model_type=s, learning_rate=1e-3)
+        model = QMNISTClassifier(model_type=s, learning_rate=lr)
         trainer = L.Trainer(
             max_epochs=10,
             accelerator="auto",
