@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import lightning as L
 import torch
 import torch.nn.functional as F
@@ -173,19 +175,45 @@ class QMNISTClassifier(L.LightningModule):
         return optim.Adam(self.parameters(), lr=self.learning_rate)
 
 
-def train_neural_networks(train_loader, val_loader, test_loader):
+class EpochSnapshotCallback(L.Callback):
+    """Saves a bare state_dict after every training epoch for video generation."""
+
+    def __init__(self, model_name: str, snapshot_dir: Path = Path("./checkpoints/snapshots")):
+        super().__init__()
+        self.save_dir = Path(snapshot_dir) / model_name
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.paths: list[Path] = []
+
+    def on_train_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        path = self.save_dir / f"epoch_{trainer.current_epoch:03d}.pth"
+        torch.save(pl_module.state_dict(), path)
+        self.paths.append(path)
+
+
+def train_neural_networks(
+    train_loader, val_loader, test_loader
+) -> dict[str, tuple[list[Path], list[str]]]:
     logger.info("Running NN Models...")
+    snapshots: dict[str, tuple[list[Path], list[str]]] = {}
 
     for s in STRATEGY_REGISTRY:
         logger.info(f"Initializing {s}...")
+        model_name = f"nn_{s}"
+        snapshot_cb = EpochSnapshotCallback(model_name=model_name)
         model = QMNISTClassifier(model_type=s, learning_rate=1e-3)
         trainer = L.Trainer(
-            max_epochs=5,
+            max_epochs=10,
             accelerator="auto",
             devices="auto",
             precision="bf16-mixed",
             enable_checkpointing=False,
+            callbacks=[snapshot_cb],
         )
         trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
         trainer.test(model=model, dataloaders=test_loader)
         torch.save(model.state_dict(), f"./models/nn_{s}.pth")
+        paths = snapshot_cb.paths
+        labels = [f"Epoch {i}" for i in range(len(paths))]
+        snapshots[model_name] = (paths, labels)
+
+    return snapshots

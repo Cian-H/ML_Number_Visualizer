@@ -1,4 +1,5 @@
-from collections.abc import Iterable, Mapping
+import io
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -281,28 +282,29 @@ def dream_input_space(
     return final_images.detach().cpu().squeeze(1).numpy(), confidences
 
 
-# Analysis engine
-def analyze_model(
+# Shared computation core — called by both the static pipeline and the video pipeline.
+def _compute_representations(
     teacher_model: TeacherModel,
-    model_name: str,
     vae: LightningVAE,
     train_loader,
     val_loader,
     device: torch.device,
     num_steps: int = 1500,
-    target_digits: Iterable[int] = range(10),
-) -> None:
-    logger.info(f"Analyzing Architecture: '{model_name}'")
+    max_surrogate_epochs: int = 10,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Train surrogates, dream channels, and return raw arrays.
 
-    early_stop = EarlyStopping(monitor="val_loss", min_delta=0.001, patience=2, mode="min")
-
-    # Train flat surrogate (blue channel)
+    Returns:
+        (vae_images, cnn_images, flat_images, vae_confs, cnn_confs, flat_confs)
+        Each *_images array is shape (10, 28, 28); each *_confs array is shape (10,).
+    """
+    # Flat surrogate — blue channel (relational logic)
     logger.info("Training relationally optimal surrogate (Flat)...")
     flat_surrogate = LightningSurrogateFlat(teacher_model=teacher_model)
     flat_trainer = L.Trainer(
-        max_epochs=10,
+        max_epochs=max_surrogate_epochs,
         accelerator="auto",
-        callbacks=[early_stop],
+        callbacks=[EarlyStopping(monitor="val_loss", min_delta=0.001, patience=2, mode="min")],
         enable_checkpointing=False,
         enable_model_summary=False,
         logger=False,
@@ -313,26 +315,28 @@ def analyze_model(
     for p in flat_surrogate.parameters():
         p.requires_grad = False
 
-    # Dispatch VAE generation based on differentiability
+    # VAE red channel — differentiable path uses direct backprop, else trains a CNN oracle
     if teacher_model.is_differentiable:
         oracle_model = teacher_model.get_differentiable_model()
         vae_images, vae_confs = generate_vae_channel_differentiable(
             oracle_model, vae, device, num_steps
         )
 
-        # We still need the CNN Surrogate for the green channel
+        # CNN surrogate — green channel (spatial machine logic)
         logger.info("Training spatially optimal surrogate (CNN)...")
         cnn_surrogate = LightningSurrogateCNN(teacher_model=teacher_model)
         cnn_trainer = L.Trainer(
-            max_epochs=10,
+            max_epochs=max_surrogate_epochs,
             accelerator="auto",
-            callbacks=[early_stop],
+            callbacks=[EarlyStopping(monitor="val_loss", min_delta=0.001, patience=2, mode="min")],
             enable_checkpointing=False,
             enable_model_summary=False,
             logger=False,
             precision="bf16-mixed",
         )
-        cnn_trainer.fit(cnn_surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        cnn_trainer.fit(
+            cnn_surrogate, train_dataloaders=train_loader, val_dataloaders=val_loader
+        )
         cnn_surrogate.to(device).eval()
         for p in cnn_surrogate.parameters():
             p.requires_grad = False
@@ -348,7 +352,26 @@ def analyze_model(
         cnn_images, cnn_confs = fut_cnn.result()
         flat_images, flat_confs = fut_flat.result()
 
-    # Composite requested digits
+    return vae_images, cnn_images, flat_images, vae_confs, cnn_confs, flat_confs
+
+
+# Analysis engine
+def analyze_model(
+    teacher_model: TeacherModel,
+    model_name: str,
+    vae: LightningVAE,
+    train_loader,
+    val_loader,
+    device: torch.device,
+    num_steps: int = 1500,
+    target_digits: Iterable[int] = range(10),
+) -> None:
+    logger.info(f"Analyzing Architecture: '{model_name}'")
+
+    vae_images, cnn_images, flat_images, vae_confs, cnn_confs, flat_confs = (
+        _compute_representations(teacher_model, vae, train_loader, val_loader, device, num_steps)
+    )
+
     plot_path = Path(f"plots/{model_name}")
     plot_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Compositing representational maps to {plot_path}/")
@@ -478,6 +501,169 @@ def generate_visualizations_for_models(
             continue
 
     logger.success("Batch visualization pipeline complete!")
+
+
+# ---------------------------------------------------------------------------
+# Evolution video pipeline
+# ---------------------------------------------------------------------------
+
+def _make_epoch_frame(
+    label: str,
+    model_name: str,
+    vae_images: np.ndarray,
+    cnn_images: np.ndarray,
+    flat_images: np.ndarray,
+    vae_confs: np.ndarray,
+    cnn_confs: np.ndarray,
+    flat_confs: np.ndarray,
+) -> "PIL.Image.Image":  # noqa: F821
+    """Render a 2×5 grid of all 10 digit representations into a PIL Image."""
+    from PIL import Image
+
+    fig, axes = plt.subplots(2, 5, figsize=(15, 7))
+    fig.suptitle(f"{model_name.upper()} — {label}", fontsize=14, fontweight="bold")
+
+    for digit in range(10):
+        ax = axes[digit // 5][digit % 5]
+        rgb_map = np.zeros((28, 28, 3), dtype=np.float32)
+        rgb_map[:, :, 0] = vae_images[digit]
+        rgb_map[:, :, 1] = cnn_images[digit]
+        rgb_map[:, :, 2] = flat_images[digit]
+        rgb_map = np.clip(rgb_map, 0.0, 1.0)
+        mean_conf = (vae_confs[digit] + cnn_confs[digit] + flat_confs[digit]) / 3.0 * 100
+        ax.imshow(rgb_map)
+        ax.set_title(f"'{digit}' — {mean_conf:.0f}%", fontsize=9)
+        ax.axis("off")
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).copy()  # .copy() detaches from the BytesIO buffer
+
+
+def generate_video_for_model(
+    model_name: str,
+    snapshot_paths: list[Path],
+    teacher_factory: Callable[[Path], TeacherModel],
+    frame_labels: list[str],
+    vae: LightningVAE,
+    train_loader,
+    val_loader,
+    device: torch.device,
+    num_steps: int = 300,
+    max_surrogate_epochs: int = 3,
+) -> None:
+    """Generate an animated GIF showing representation evolution across snapshots."""
+    from PIL import Image  # noqa: F401 — ensure PIL is imported for type
+
+    logger.info(f"Generating evolution video for '{model_name}' ({len(snapshot_paths)} frames)...")
+    frames: list = []
+
+    for snapshot_path, label in zip(snapshot_paths, frame_labels, strict=True):
+        logger.info(f"  [{model_name}] {label} ...")
+        try:
+            teacher = teacher_factory(snapshot_path)
+            arrays = _compute_representations(
+                teacher, vae, train_loader, val_loader, device, num_steps, max_surrogate_epochs
+            )
+            vae_imgs, cnn_imgs, flat_imgs, vae_c, cnn_c, flat_c = arrays
+            frames.append(
+                _make_epoch_frame(label, model_name, vae_imgs, cnn_imgs, flat_imgs, vae_c, cnn_c, flat_c)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"  Skipping frame '{label}' for '{model_name}': {exc}")
+
+    if not frames:
+        logger.warning(f"No frames generated for '{model_name}' — skipping GIF.")
+        return
+
+    plot_path = Path(f"plots/{model_name}")
+    plot_path.mkdir(parents=True, exist_ok=True)
+    gif_path = plot_path / "evolution.gif"
+    frames[0].save(
+        gif_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=800,  # ms per frame
+        loop=0,
+    )
+    logger.success(f"Evolution GIF saved → {gif_path}")
+
+
+def generate_videos_for_models(
+    nn_snapshots: dict[str, tuple[list[Path], list[str]]],
+    sklearn_snapshots: dict[str, tuple[list[Path], list[str]]],
+    num_steps: int = 300,
+    max_surrogate_epochs: int = 3,
+) -> None:
+    """Generate training-evolution GIFs for all models with available snapshots."""
+    import joblib
+
+    from ml_number_visualizer.neural_networks import QMNISTClassifier
+    from ml_number_visualizer.protocols import PyTorchAdapter, SklearnAdapter
+
+    all_snapshots = {**nn_snapshots, **sklearn_snapshots}
+    if not all_snapshots:
+        logger.info("No snapshots available — skipping video generation.")
+        return
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_loader, val_loader, _ = get_dataset()
+
+    # One shared VAE is enough — it represents the global human prior, not the teacher.
+    logger.info("Training Global VAE for evolution videos...")
+    vae = LightningVAE()
+    vae_trainer = L.Trainer(
+        max_epochs=3,
+        accelerator="auto",
+        devices="auto",
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        logger=False,
+        precision="bf16-mixed",
+    )
+    vae_trainer.fit(vae, train_dataloaders=train_loader)
+    vae.to(device).eval()
+    for p in vae.parameters():
+        p.requires_grad = False
+
+    # Unified loop — dispatch on name prefix to pick the right teacher factory.
+    for model_name, (paths, labels) in all_snapshots.items():
+        if model_name.startswith("nn_"):
+            strategy = model_name.split("_", 1)[1]  # "nn_flat" → "flat"
+
+            # Default-arg capture prevents the classic loop-variable closure bug.
+            def _factory(path: Path, _s: str = strategy) -> TeacherModel:
+                m = QMNISTClassifier(model_type=_s)
+                m.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+                m = m.to(device).eval()
+                for param in m.parameters():
+                    param.requires_grad = False
+                return PyTorchAdapter(m)
+
+        else:
+            def _factory(path: Path) -> TeacherModel:  # type: ignore[misc]
+                return SklearnAdapter(joblib.load(path))
+
+        try:
+            generate_video_for_model(
+                model_name=model_name,
+                snapshot_paths=paths,
+                teacher_factory=_factory,
+                frame_labels=labels,
+                vae=vae,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                device=device,
+                num_steps=num_steps,
+                max_surrogate_epochs=max_surrogate_epochs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Video generation failed for '{model_name}': {exc}")
+
+    logger.success("Evolution video generation complete!")
 
 
 def generate_legend() -> None:

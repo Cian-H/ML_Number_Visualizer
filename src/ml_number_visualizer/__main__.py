@@ -11,18 +11,22 @@ def main():
     from .neural_networks import train_neural_networks
     from .protocols import LazyModelAdapter
     from .sklearn_models import train_sklearn
-    from .visualize import generate_visualizations_for_models
+    from .visualize import generate_videos_for_models, generate_visualizations_for_models
 
     logger.info("Loading datasets...")
     train_loader, val_loader, test_loader = get_dataset()
 
-    train_neural_networks(train_loader, val_loader, test_loader)
-    train_sklearn(train_loader, val_loader, test_loader)
+    nn_snapshots = train_neural_networks(train_loader, val_loader, test_loader)
+    sklearn_snapshots = train_sklearn(train_loader, val_loader, test_loader)
 
     logger.info("Generating digit representations for models...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     models = {p.stem: LazyModelAdapter(p, device) for p in Path("./models").glob("[!.]*")}
     generate_visualizations_for_models(models)
+
+    logger.info("Generating training evolution videos...")
+    generate_videos_for_models(nn_snapshots, sklearn_snapshots)
+
     logger.success("DONE!")
 
 
