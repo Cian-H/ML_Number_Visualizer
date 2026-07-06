@@ -1,4 +1,4 @@
-import pickle
+import joblib
 
 from loguru import logger
 from sklearn.ensemble import RandomForestClassifier
@@ -15,5 +15,4 @@ def train_sklearn(train_loader, val_loader, test_loader):
     logger.info("Training Scikit-Learn Random Forest...")
     rf_model = RandomForestClassifier(n_estimators=50, max_depth=15)
     rf_model.fit(X_train, y_train)
-    with open("./models/sklearn_rf.pkl", "wb") as f:
-        pickle.dump(rf_model, f)
+    joblib.dump(rf_model, "./models/sklearn_rf.joblib")

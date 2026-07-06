@@ -20,10 +20,12 @@ def create_dataset(
     shuffle = kwargs.pop("shuffle", False)
     shuffle_train = kwargs.pop("shuffle_train", False)
 
-    kwargs["pin_memory"] = True
-    kwargs["num_workers"] = 16
-    kwargs["prefetch_factor"] = 8
-    kwargs["persistent_workers"] = True
+    num_workers = kwargs.get("num_workers", 0)
+    kwargs.setdefault("num_workers", 0)
+    kwargs.setdefault("pin_memory", num_workers > 0)
+    if num_workers > 0:
+        kwargs.setdefault("prefetch_factor", 8)
+        kwargs.setdefault("persistent_workers", True)
 
     to_shuffle = (shuffle or shuffle_train, shuffle, shuffle)
     train, val, test = (

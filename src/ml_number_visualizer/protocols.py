@@ -1,4 +1,4 @@
-import pickle
+import joblib
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -86,8 +86,7 @@ class LazyModelAdapter:
 
         # Scikit-Learn Model
         if self.path.suffix in [".pkl", ".joblib"]:
-            with open(self.path, "rb") as f:
-                model = pickle.load(f)
+            model = joblib.load(self.path)
             self._inner_adapter = SklearnAdapter(model)
 
         # PyTorch Model

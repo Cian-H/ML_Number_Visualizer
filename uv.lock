@@ -1192,6 +1192,7 @@ name = "ml-number-visualiser"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "joblib" },
     { name = "jupyter" },
     { name = "lightning" },
     { name = "loguru" },
@@ -1215,6 +1216,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "joblib", specifier = ">=1.4.0" },
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "lightning", specifier = ">=2.4.0" },
     { name = "loguru", specifier = ">=0.7.2" },
